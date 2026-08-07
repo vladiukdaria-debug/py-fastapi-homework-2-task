@@ -53,7 +53,7 @@ class LanguageSchema(BaseModel):
     name: str
 
 
-class MovieDetailResponseSchema(BaseModel):
+class MovieDetailSchema(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
