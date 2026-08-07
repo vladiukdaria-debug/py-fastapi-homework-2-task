@@ -1,4 +1,4 @@
-from typing import Any, cast
+from typing import Any
 
 from fastapi import (
     APIRouter,
@@ -6,23 +6,22 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Response,
+    status,
 )
-from starlette.responses import Response
 from pydantic import ValidationError
-from sqlalchemy import desc, func, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import joinedload, selectinload
-from starlette import status
+from sqlalchemy.orm import selectinload
 
+from database import MovieModel, get_db
 from database.models import (
     ActorModel,
     CountryModel,
     GenreModel,
     LanguageModel,
-    MovieModel,
 )
-from database.session_postgresql import get_postgresql_db
 from schemas.movies import (
     MovieCreateSchema,
     MovieDetailResponseSchema,
@@ -31,46 +30,102 @@ from schemas.movies import (
 )
 
 
-router = APIRouter(
-    prefix="/movies",
-    tags=["movies"],
-)
+router = APIRouter(prefix="/movies")
 
 
-async def get_or_create_by_name(
+async def get_or_create_country(
     db: AsyncSession,
-    model: Any,
+    code: str,
+) -> CountryModel:
+    stmt = select(CountryModel).where(
+        CountryModel.code == code
+    )
+
+    result = await db.execute(stmt)
+    country = result.scalars().first()
+
+    if country is None:
+        country = CountryModel(
+            code=code,
+            name=None,
+        )
+        db.add(country)
+
+    return country
+
+
+async def get_or_create_genre(
+    db: AsyncSession,
     name: str,
-) -> Any:
-    query = select(model).where(model.name == name)
-    result = await db.execute(query)
-    item = result.scalar_one_or_none()
+) -> GenreModel:
+    stmt = select(GenreModel).where(
+        GenreModel.name == name
+    )
 
-    if item is None:
-        item = model(name=name)
-        db.add(item)
-        await db.flush()
+    result = await db.execute(stmt)
+    genre = result.scalars().first()
 
-    return item
+    if genre is None:
+        genre = GenreModel(name=name)
+        db.add(genre)
+
+    return genre
+
+
+async def get_or_create_actor(
+    db: AsyncSession,
+    name: str,
+) -> ActorModel:
+    stmt = select(ActorModel).where(
+        ActorModel.name == name
+    )
+
+    result = await db.execute(stmt)
+    actor = result.scalars().first()
+
+    if actor is None:
+        actor = ActorModel(name=name)
+        db.add(actor)
+
+    return actor
+
+
+async def get_or_create_language(
+    db: AsyncSession,
+    name: str,
+) -> LanguageModel:
+    stmt = select(LanguageModel).where(
+        LanguageModel.name == name
+    )
+
+    result = await db.execute(stmt)
+    language = result.scalars().first()
+
+    if language is None:
+        language = LanguageModel(name=name)
+        db.add(language)
+
+    return language
 
 
 async def get_movie_with_relations(
     db: AsyncSession,
     movie_id: int,
 ) -> MovieModel | None:
-    query = (
+    stmt = (
         select(MovieModel)
         .where(MovieModel.id == movie_id)
         .options(
-            joinedload(MovieModel.country),
+            selectinload(MovieModel.country),
             selectinload(MovieModel.genres),
             selectinload(MovieModel.actors),
             selectinload(MovieModel.languages),
         )
     )
 
-    result = await db.execute(query)
-    return result.scalar_one_or_none()
+    result = await db.execute(stmt)
+
+    return result.scalars().first()
 
 
 @router.get(
@@ -80,23 +135,28 @@ async def get_movie_with_relations(
 async def get_movies(
     page: int = Query(default=1, ge=1),
     per_page: int = Query(default=10, ge=1, le=20),
-    db: AsyncSession = Depends(get_postgresql_db),
-) -> MovieListResponseSchema:
-    count_query = select(func.count(MovieModel.id))
-    count_result = await db.execute(count_query)
+    db: AsyncSession = Depends(get_db),
+):
+    count_stmt = select(
+        func.count(MovieModel.id)
+    )
+
+    count_result = await db.execute(count_stmt)
+
     total_items = count_result.scalar_one()
 
     offset = (page - 1) * per_page
 
-    movies_query = (
+    stmt = (
         select(MovieModel)
-        .order_by(desc(MovieModel.id))
+        .order_by(MovieModel.id.desc())
         .offset(offset)
         .limit(per_page)
     )
 
-    movies_result = await db.execute(movies_query)
-    movies = movies_result.scalars().all()
+    result = await db.execute(stmt)
+
+    movies = result.scalars().all()
 
     if not movies:
         raise HTTPException(
@@ -108,28 +168,31 @@ async def get_movies(
         total_items + per_page - 1
     ) // per_page
 
-    prev_page = None
-    next_page = None
-
     if page > 1:
         prev_page = (
             f"/theater/movies/"
-            f"?page={page - 1}&per_page={per_page}"
+            f"?page={page - 1}"
+            f"&per_page={per_page}"
         )
+    else:
+        prev_page = None
 
     if page < total_pages:
         next_page = (
             f"/theater/movies/"
-            f"?page={page + 1}&per_page={per_page}"
+            f"?page={page + 1}"
+            f"&per_page={per_page}"
         )
+    else:
+        next_page = None
 
-    return MovieListResponseSchema(
-        movies=movies,
-        prev_page=prev_page,
-        next_page=next_page,
-        total_pages=total_pages,
-        total_items=total_items,
-    )
+    return {
+        "movies": movies,
+        "prev_page": prev_page,
+        "next_page": next_page,
+        "total_pages": total_pages,
+        "total_items": total_items,
+    }
 
 
 @router.post(
@@ -138,75 +201,69 @@ async def get_movies(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_movie(
-    raw_data: Any = Body(...),
-    db: AsyncSession = Depends(get_postgresql_db),
-) -> MovieModel:
+    payload: Any = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
     try:
-        movie_data = MovieCreateSchema.model_validate(raw_data)
-    except ValidationError as error:
+        movie_data = MovieCreateSchema.model_validate(
+            payload
+        )
+    except ValidationError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid input data.",
-        ) from error
+        )
 
-    duplicate_query = select(MovieModel).where(
+    stmt = select(MovieModel).where(
         MovieModel.name == movie_data.name,
         MovieModel.date == movie_data.date,
     )
 
-    duplicate_result = await db.execute(duplicate_query)
-    existing_movie = duplicate_result.scalar_one_or_none()
+    result = await db.execute(stmt)
+
+    existing_movie = result.scalars().first()
 
     if existing_movie is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                "A movie with the same name and release date "
-                "already exists."
+                f"A movie with the name "
+                f"'{movie_data.name}' "
+                f"and release date "
+                f"'{movie_data.date.isoformat()}' "
+                f"already exists."
             ),
         )
 
-    country_query = select(CountryModel).where(
-        CountryModel.code == movie_data.country
+    country = await get_or_create_country(
+        db,
+        movie_data.country,
     )
-
-    country_result = await db.execute(country_query)
-    country = country_result.scalar_one_or_none()
-
-    if country is None:
-        country = CountryModel(
-            code=movie_data.country,
-        )
-        db.add(country)
-        await db.flush()
 
     genres = []
 
     for genre_name in movie_data.genres:
-        genre = await get_or_create_by_name(
-            db=db,
-            model=GenreModel,
-            name=genre_name,
+        genre = await get_or_create_genre(
+            db,
+            genre_name,
         )
         genres.append(genre)
 
     actors = []
 
     for actor_name in movie_data.actors:
-        actor = await get_or_create_by_name(
-            db=db,
-            model=ActorModel,
-            name=actor_name,
+        actor = await get_or_create_actor(
+            db,
+            actor_name,
         )
         actors.append(actor)
 
     languages = []
 
     for language_name in movie_data.languages:
-        language = await get_or_create_by_name(
-            db=db,
-            model=LanguageModel,
-            name=language_name,
+        language = await get_or_create_language(
+            db,
+            language_name,
         )
         languages.append(language)
 
@@ -225,34 +282,28 @@ async def create_movie(
     )
 
     db.add(movie)
+
     try:
-        await db.flush()
-
-        movie_id = cast(int, movie.id)
-
         await db.commit()
 
-    except IntegrityError as error:
+    except IntegrityError:
         await db.rollback()
 
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                "A movie with the same name and release date "
-                "already exists."
-            )
-        ) from error
+                f"A movie with the name "
+                f"'{movie_data.name}' "
+                f"and release date "
+                f"'{movie_data.date.isoformat()}' "
+                f"already exists."
+            ),
+        )
 
     created_movie = await get_movie_with_relations(
-        db=db,
-        movie_id=movie_id,
+        db,
+        movie.id,
     )
-
-    if created_movie is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Movie with the given ID was not found.",
-        )
 
     return created_movie
 
@@ -261,13 +312,13 @@ async def create_movie(
     "/{movie_id}/",
     response_model=MovieDetailResponseSchema,
 )
-async def get_movie_by_id(
+async def get_movie(
     movie_id: int,
-    db: AsyncSession = Depends(get_postgresql_db),
-) -> MovieModel:
+    db: AsyncSession = Depends(get_db),
+):
     movie = await get_movie_with_relations(
-        db=db,
-        movie_id=movie_id,
+        db,
+        movie_id,
     )
 
     if movie is None:
@@ -279,83 +330,21 @@ async def get_movie_by_id(
     return movie
 
 
-@router.patch(
-    "/{movie_id}/",
-    response_model=MovieDetailResponseSchema,
-)
-async def update_movie(
-    movie_id: int,
-    raw_data: Any = Body(...),
-    db: AsyncSession = Depends(get_postgresql_db),
-) -> MovieModel:
-    movie = await get_movie_with_relations(
-        db=db,
-        movie_id=movie_id,
-    )
-
-    if movie is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Movie with the given ID was not found.",
-        )
-
-    try:
-        movie_data = MovieUpdateSchema.model_validate(raw_data)
-    except ValidationError as error:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid input data.",
-        ) from error
-
-    update_data = movie_data.model_dump(
-        exclude_unset=True,
-    )
-
-    for field_name, field_value in update_data.items():
-        setattr(movie, field_name, field_value)
-
-    try:
-        await db.commit()
-
-    except IntegrityError as error:
-        await db.rollback()
-
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "A movie with the same name and release date "
-                "already exists."
-            ),
-        ) from error
-
-    updated_movie = await get_movie_with_relations(
-        db=db,
-        movie_id=movie_id,
-    )
-
-    if updated_movie is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Movie with the given ID was not found.",
-        )
-
-    return updated_movie
-
-
 @router.delete(
     "/{movie_id}/",
     status_code=status.HTTP_204_NO_CONTENT,
 )
 async def delete_movie(
     movie_id: int,
-    db: AsyncSession = Depends(get_postgresql_db),
-) -> Response:
-    query = select(MovieModel).where(
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(MovieModel).where(
         MovieModel.id == movie_id
     )
 
-    result = await db.execute(query)
-    movie = result.scalar_one_or_none()
+    result = await db.execute(stmt)
+
+    movie = result.scalars().first()
 
     if movie is None:
         raise HTTPException(
@@ -367,5 +356,72 @@ async def delete_movie(
     await db.commit()
 
     return Response(
-        status_code=status.HTTP_204_NO_CONTENT,
+        status_code=status.HTTP_204_NO_CONTENT
     )
+
+
+@router.patch("/{movie_id}/")
+async def update_movie(
+    movie_id: int,
+    payload: Any = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(MovieModel).where(
+        MovieModel.id == movie_id
+    )
+
+    result = await db.execute(stmt)
+
+    movie = result.scalars().first()
+
+    if movie is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Movie with the given ID was not found.",
+        )
+
+    try:
+        movie_data = MovieUpdateSchema.model_validate(
+            payload
+        )
+
+    except ValidationError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid input data.",
+        )
+
+    update_data = movie_data.model_dump(
+        exclude_unset=True
+    )
+
+    if any(
+        value is None
+        for value in update_data.values()
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid input data.",
+        )
+
+    for field, value in update_data.items():
+        setattr(
+            movie,
+            field,
+            value,
+        )
+
+    try:
+        await db.commit()
+
+    except IntegrityError:
+        await db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid input data.",
+        )
+
+    return {
+        "detail": "Movie updated successfully."
+    }
