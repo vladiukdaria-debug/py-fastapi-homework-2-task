@@ -1,5 +1,13 @@
-from schemas.movies import (
+from .movies import (
+    MovieCreateSchema,
     MovieDetailSchema,
     MovieListResponseSchema,
-    MovieListItemSchema
+    MovieUpdateSchema,
 )
+
+__all__ = [
+    "MovieCreateSchema",
+    "MovieDetailSchema",
+    "MovieListResponseSchema",
+    "MovieUpdateSchema",
+]

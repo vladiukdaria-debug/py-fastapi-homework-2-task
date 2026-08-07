@@ -6,6 +6,7 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Request,
     Response,
     status,
 )
@@ -133,6 +134,7 @@ async def get_movie_with_relations(
     response_model=MovieListResponseSchema,
 )
 async def get_movies(
+    request: Request,
     page: int = Query(default=1, ge=1),
     per_page: int = Query(default=10, ge=1, le=20),
     db: AsyncSession = Depends(get_db),
@@ -142,7 +144,6 @@ async def get_movies(
     )
 
     count_result = await db.execute(count_stmt)
-
     total_items = count_result.scalar_one()
 
     offset = (page - 1) * per_page
@@ -155,7 +156,6 @@ async def get_movies(
     )
 
     result = await db.execute(stmt)
-
     movies = result.scalars().all()
 
     if not movies:
@@ -168,9 +168,11 @@ async def get_movies(
         total_items + per_page - 1
     ) // per_page
 
+    base_path = request.url.path
+
     if page > 1:
         prev_page = (
-            f"/theater/movies/"
+            f"{base_path}"
             f"?page={page - 1}"
             f"&per_page={per_page}"
         )
@@ -179,7 +181,7 @@ async def get_movies(
 
     if page < total_pages:
         next_page = (
-            f"/theater/movies/"
+            f"{base_path}"
             f"?page={page + 1}"
             f"&per_page={per_page}"
         )
@@ -220,7 +222,6 @@ async def create_movie(
     )
 
     result = await db.execute(stmt)
-
     existing_movie = result.scalars().first()
 
     if existing_movie is not None:
@@ -284,8 +285,9 @@ async def create_movie(
     db.add(movie)
 
     try:
+        await db.flush()
+        movie_id = movie.id
         await db.commit()
-
     except IntegrityError:
         await db.rollback()
 
@@ -302,7 +304,7 @@ async def create_movie(
 
     created_movie = await get_movie_with_relations(
         db,
-        movie.id,
+        movie_id,
     )
 
     return created_movie
@@ -310,7 +312,7 @@ async def create_movie(
 
 @router.get(
     "/{movie_id}/",
-    response_model=MovieDetailResponseSchema,
+    response_model=MovieDetailSchema,
 )
 async def get_movie(
     movie_id: int,
@@ -343,7 +345,6 @@ async def delete_movie(
     )
 
     result = await db.execute(stmt)
-
     movie = result.scalars().first()
 
     if movie is None:
@@ -352,8 +353,16 @@ async def delete_movie(
             detail="Movie with the given ID was not found.",
         )
 
-    await db.delete(movie)
-    await db.commit()
+    try:
+        await db.delete(movie)
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Movie could not be deleted.",
+        )
 
     return Response(
         status_code=status.HTTP_204_NO_CONTENT
@@ -366,13 +375,10 @@ async def update_movie(
     payload: Any = Body(...),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(MovieModel).where(
-        MovieModel.id == movie_id
+    movie = await get_movie_with_relations(
+        db,
+        movie_id,
     )
-
-    result = await db.execute(stmt)
-
-    movie = result.scalars().first()
 
     if movie is None:
         raise HTTPException(
@@ -384,7 +390,6 @@ async def update_movie(
         movie_data = MovieUpdateSchema.model_validate(
             payload
         )
-
     except ValidationError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -395,6 +400,12 @@ async def update_movie(
         exclude_unset=True
     )
 
+    if not update_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No data was provided for update.",
+        )
+
     if any(
         value is None
         for value in update_data.values()
@@ -403,6 +414,54 @@ async def update_movie(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid input data.",
         )
+
+    if "country" in update_data:
+        country_code = update_data.pop("country")
+        movie.country = await get_or_create_country(
+            db,
+            country_code,
+        )
+
+    if "genres" in update_data:
+        genre_names = update_data.pop("genres")
+        genres = []
+
+        for genre_name in genre_names:
+            genre = await get_or_create_genre(
+                db,
+                genre_name,
+            )
+            genres.append(genre)
+
+        movie.genres = genres
+
+    if "actors" in update_data:
+        actor_names = update_data.pop("actors")
+        actors = []
+
+        for actor_name in actor_names:
+            actor = await get_or_create_actor(
+                db,
+                actor_name,
+            )
+            actors.append(actor)
+
+        movie.actors = actors
+
+    if "languages" in update_data:
+        language_names = update_data.pop(
+            "languages"
+        )
+        languages = []
+
+        for language_name in language_names:
+            language = await get_or_create_language(
+                db,
+                language_name,
+            )
+            languages.append(language)
+
+        movie.languages = languages
 
     for field, value in update_data.items():
         setattr(
@@ -413,13 +472,12 @@ async def update_movie(
 
     try:
         await db.commit()
-
     except IntegrityError:
         await db.rollback()
 
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid input data.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Movie update conflicts with existing data.",
         )
 
     return {
