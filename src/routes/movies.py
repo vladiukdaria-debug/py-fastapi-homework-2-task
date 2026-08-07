@@ -24,7 +24,7 @@ from database.models import (
 )
 from schemas.movies import (
     MovieCreateSchema,
-    MovieDetailResponseSchema,
+    MovieDetailSchema,
     MovieListResponseSchema,
     MovieUpdateSchema,
 )
@@ -197,7 +197,7 @@ async def get_movies(
 
 @router.post(
     "/",
-    response_model=MovieDetailResponseSchema,
+    response_model=MovieDetailSchema,
     status_code=status.HTTP_201_CREATED,
 )
 async def create_movie(
