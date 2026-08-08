@@ -168,7 +168,7 @@ async def get_movies(
         total_items + per_page - 1
     ) // per_page
 
-    base_path = request.url.path
+    base_path = request.url.path.removeprefix("/api/v1")
 
     if page > 1:
         prev_page = (
